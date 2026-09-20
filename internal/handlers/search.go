@@ -35,6 +35,14 @@ func (h *SearchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	q := r.URL.Query()
 
+	// A multi-city search is signaled by giving origin/destination/date more
+	// than once (one triple per leg); the common case of exactly one value
+	// each falls through to the one-way/round-trip handling below.
+	if isMultiCitySearch(q) {
+		h.serveMultiCity(w, r, q)
+		return
+	}
+
 	origin := strings.ToUpper(strings.TrimSpace(q.Get("origin")))
 	destination := strings.ToUpper(strings.TrimSpace(q.Get("destination")))
 	date := strings.TrimSpace(q.Get("date"))
@@ -171,33 +179,55 @@ func (h *SearchHandler) searchLeg(ctx context.Context, params models.SearchParam
 }
 
 // searchBothLegs runs the outbound and return legs of a round trip
-// concurrently (each leg already fans out to all providers internally, so
-// running the two legs in parallel roughly halves total latency compared to
-// running them one after another) and returns as soon as both are done. If
-// either leg fails, its error is returned; the other leg's goroutine is
-// still allowed to finish before this function returns.
+// concurrently via searchLegs and unpacks the two-element result.
 func (h *SearchHandler) searchBothLegs(ctx context.Context, outboundParams, returnParams models.SearchParams, bypassCache bool, fp models.FilterParams, sortOpt models.SortOption) (outbound []models.Flight, outboundMeta models.Metadata, ret []models.Flight, returnMeta models.Metadata, err error) {
-	var outboundErr, returnErr error
+	flights, metas, err := h.searchLegs(ctx, []models.SearchParams{outboundParams, returnParams}, bypassCache, fp, sortOpt)
+	if err != nil {
+		return nil, models.Metadata{}, nil, models.Metadata{}, err
+	}
+	return flights[0], metas[0], flights[1], metas[1], nil
+}
+
+// legResult holds one segment's search outcome, gathered from its own
+// goroutine in searchLegs.
+type legResult struct {
+	flights []models.Flight
+	meta    models.Metadata
+	err     error
+}
+
+// searchLegs runs every segment's aggregated search concurrently -- each
+// segment already fans out to all providers internally (see
+// aggregator.Aggregator.Search), so running the segments themselves in
+// parallel too keeps an N-segment search close to the cost of its slowest
+// single segment rather than the sum of all of them -- and returns once
+// every segment is done. If any segment fails, its error is returned; every
+// other segment's goroutine is still allowed to finish first. On success,
+// the returned slices are ordered to match segments.
+func (h *SearchHandler) searchLegs(ctx context.Context, segments []models.SearchParams, bypassCache bool, fp models.FilterParams, sortOpt models.SortOption) ([][]models.Flight, []models.Metadata, error) {
+	results := make([]legResult, len(segments))
 
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		outbound, outboundMeta, outboundErr = h.searchLeg(ctx, outboundParams, bypassCache, fp, sortOpt)
-	}()
-	go func() {
-		defer wg.Done()
-		ret, returnMeta, returnErr = h.searchLeg(ctx, returnParams, bypassCache, fp, sortOpt)
-	}()
+	wg.Add(len(segments))
+	for i, params := range segments {
+		go func(i int, params models.SearchParams) {
+			defer wg.Done()
+			flights, meta, err := h.searchLeg(ctx, params, bypassCache, fp, sortOpt)
+			results[i] = legResult{flights: flights, meta: meta, err: err}
+		}(i, params)
+	}
 	wg.Wait()
 
-	if outboundErr != nil {
-		return nil, models.Metadata{}, nil, models.Metadata{}, outboundErr
+	flights := make([][]models.Flight, len(segments))
+	metas := make([]models.Metadata, len(segments))
+	for i, r := range results {
+		if r.err != nil {
+			return nil, nil, r.err
+		}
+		flights[i] = r.flights
+		metas[i] = r.meta
 	}
-	if returnErr != nil {
-		return nil, models.Metadata{}, nil, models.Metadata{}, returnErr
-	}
-	return outbound, outboundMeta, ret, returnMeta, nil
+	return flights, metas, nil
 }
 
 func parseFilterParams(q url.Values) (models.FilterParams, error) {

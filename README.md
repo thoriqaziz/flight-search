@@ -38,6 +38,18 @@ Required:
 
 Optional search params:
 - `passengers` (default 1), `cabin_class` (default `economy`)
+- `return_date` (`YYYY-MM-DD`) — makes this a round trip: also searches the
+  return leg (`destination` → `origin` departing on `return_date`). Must not
+  be before `date`; a same-day round trip is allowed. Omit it for a one-way
+  search (the default).
+- **Multi-city**: give `origin`, `destination`, and `date` more than once —
+  one triple per leg — instead of once each, e.g. `?origin=CGK&origin=DPS&
+  origin=SUB&destination=DPS&destination=SUB&destination=CGK&date=2025-12-15
+  &date=2025-12-18&date=2025-12-22` for a `CGK → DPS → SUB → CGK` itinerary.
+  All three arrays must have the same length; up to 6 segments; each
+  segment's date must not be before the previous segment's; `return_date` is
+  not valid alongside repeated params (use a segment for the return leg
+  instead). See "Round trip and multi-city" below for the response shape.
 - `refresh` or `no_cache` (`true`/`false`, default `false`) — skip reading the cached result for this exact search and re-query providers, refreshing the cache. Useful right after editing a fixture in `input/` when you don't want to wait out `CACHE_TTL_SECONDS`.
 
 Filters (all optional, combine with AND):
@@ -53,11 +65,36 @@ Sorting:
 
 `GET /health` — liveness check.
 
+### Example requests
+
+```
+# One-way
+curl "http://localhost:8080/api/v1/search?origin=CGK&destination=DPS&date=2025-12-15"
+
+# Round trip
+curl "http://localhost:8080/api/v1/search?origin=CGK&destination=DPS&date=2025-12-15&return_date=2025-12-20"
+
+# Multi-city: CGK -> DPS -> SUB -> CGK
+curl "http://localhost:8080/api/v1/search?origin=CGK&origin=DPS&origin=SUB&destination=DPS&destination=SUB&destination=CGK&date=2025-12-15&date=2025-12-18&date=2025-12-22"
+```
+
+Note the multi-city request repeats `origin`, `destination`, and `date` --
+each repetition adds one query param value under the same key rather than a
+new key, which is what tells the handler "this is N legs, not 1" (see
+`isMultiCitySearch` in `internal/handlers/multicity.go`). A shell or `curl`
+handles that automatically as written above; if you're building the URL
+yourself (e.g. in code), make sure your HTTP client actually serializes
+repeated keys rather than overwriting the value on each assignment.
+
 ### Response shape
+
+The three trip types below share one envelope (`models.SearchResponse`) but
+populate different fields; `search_criteria.trip_type` tells you which one
+you got. A one-way response looks like this:
 
 ```json
 {
-  "search_criteria": { "origin": "CGK", "destination": "DPS", "departure_date": "2025-12-15", "passengers": 1, "cabin_class": "economy" },
+  "search_criteria": { "origin": "CGK", "destination": "DPS", "departure_date": "2025-12-15", "trip_type": "one_way", "passengers": 1, "cabin_class": "economy" },
   "metadata": {
     "total_results": 13,
     "providers_queried": 4,
@@ -94,6 +131,92 @@ Sorting:
 flight number, route and departure instant) was quoted by more than one
 provider — see "Cross-provider merging" below.
 
+A round trip replaces `flights` with `outbound_flights`/`return_flights`
+(each shaped like a one-way `flights` entry) plus a `return_metadata` block
+and an optional `round_trip_estimate`:
+
+```json
+{
+  "search_criteria": { "origin": "CGK", "destination": "DPS", "departure_date": "2025-12-15", "return_date": "2025-12-20", "trip_type": "round_trip", "passengers": 1, "cabin_class": "economy" },
+  "metadata": { "total_results": 13, "...": "outbound leg's stats" },
+  "return_metadata": { "total_results": 0, "...": "return leg's stats" },
+  "flights": null,
+  "outbound_flights": [ /* CGK -> DPS */ ],
+  "return_flights": [ /* DPS -> CGK */ ],
+  "round_trip_estimate": {
+    "cheapest_outbound_id": "QZ7250_AirAsia",
+    "cheapest_return_id": "QZ100_AirAsia",
+    "total_price": { "amount": 970000, "currency": "IDR", "formatted": "Rp 970.000" }
+  }
+}
+```
+
+A multi-city search replaces `flights` with a `segments` array (one entry
+per requested leg) plus an optional `multi_city_estimate`:
+
+```json
+{
+  "search_criteria": {
+    "trip_type": "multi_city",
+    "segments": [
+      { "origin": "CGK", "destination": "DPS", "date": "2025-12-15" },
+      { "origin": "DPS", "destination": "SUB", "date": "2025-12-18" },
+      { "origin": "SUB", "destination": "CGK", "date": "2025-12-22" }
+    ],
+    "passengers": 1, "cabin_class": "economy"
+  },
+  "metadata": { "total_results": 13, "providers_queried": 12, "...": "rolled up across all 3 segments" },
+  "flights": null,
+  "outbound_flights": null,
+  "return_flights": null,
+  "segments": [
+    { "origin": "CGK", "destination": "DPS", "date": "2025-12-15", "metadata": { "...": "this segment's own stats" }, "flights": [ /* ... */ ] },
+    { "origin": "DPS", "destination": "SUB", "date": "2025-12-18", "metadata": { "...": "" }, "flights": [] },
+    { "origin": "SUB", "destination": "CGK", "date": "2025-12-22", "metadata": { "...": "" }, "flights": [] }
+  ],
+  "multi_city_estimate": null
+}
+```
+
+(The example above shows what you'll actually get running this against the
+bundled mock fixtures, which only cover the `CGK → DPS` direction — segments
+1 and 2 legitimately come back empty, which is also why
+`multi_city_estimate` is `null`: it's only populated when every segment has
+at least one result. Note `null` vs. an empty array `[]` is meaningful
+throughout this schema — see the field-by-field note in
+`models.SearchResponse`.)
+
+## Round trip and multi-city
+
+Round trip (`return_date`) and multi-city (repeated `origin`/`destination`/
+`date`) are both built on the same mechanism: `SearchHandler.searchLegs`
+(`internal/handlers/search.go`) runs an arbitrary number of independent
+single-leg searches **concurrently** — one call to `aggregator.Search` per
+leg, each of which *itself* already fans out to all 4 providers concurrently
+— so an N-leg search costs close to the time of its slowest single leg
+rather than the sum of all of them. `searchBothLegs` (round trip) is a
+2-element special case of the same function; `serveMultiCity`
+(`internal/handlers/multicity.go`) is the general N-element case.
+
+Every leg is filtered, best-value-ranked, and sorted independently using the
+same `filter`/`ranking`/`sort_by` params — there's no per-leg override, and
+no combinatorial pairing of every outbound flight with every return flight
+(or every leg-1 flight with every leg-2 flight). That mirrors how real
+booking UIs work: you pick each leg separately. The one piece of
+cross-leg information provided is a convenience estimate
+(`round_trip_estimate` / `multi_city_estimate`): the cheapest flight on each
+leg, summed, computed independently of whatever sort order was requested.
+It's `null` whenever any leg has zero results, or when legs' cheapest
+flights are priced in different currencies (summing mismatched currencies
+would be meaningless).
+
+Multi-city validation (`internal/handlers/multicity.go`): the `origin`,
+`destination`, and `date` arrays must have equal length; at most
+`maxMultiCitySegments` (6) legs; each leg's date must not be before the
+previous leg's; and `return_date` is rejected outright if given alongside
+repeated params, rather than being silently ignored, since combining the two
+input styles has no well-defined meaning.
+
 ## Architecture
 
 ```
@@ -121,7 +244,10 @@ Request flow: `handlers.SearchHandler` parses the query string, calls
 `aggregator.Search` (which checks the cache, or fans out to all four
 providers concurrently with per-provider timeouts and merges the results),
 applies `filter.Apply`, computes `ranking.Compute` scores, and finally
-`sortutil.Apply`s the requested ordering.
+`sortutil.Apply`s the requested ordering. For a round trip or multi-city
+search, this whole sequence (`searchLeg`) runs once per leg, with every
+leg's `searchLeg` call run concurrently via `searchLegs` — see "Round trip
+and multi-city" above.
 
 ## Handling real-world data problems
 
@@ -279,7 +405,3 @@ All via environment variables, all optional:
 | `CACHE_TTL_SECONDS` | `180` | aggregated result cache lifetime |
 | `MOCK_SERVER_PORT` | `8081` | mock server port (cmd/mockserver only) |
 | `FIXTURES_DIR` | `input` | directory the mock server reads fixtures from |
-
-`price_comparison` is only populated when the same physical flight (same
-flight number, route and departure instant) was quoted by more than one
-provider — see "Cross-provider merging" below.
