@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"flight-search/internal/aggregator"
 	"flight-search/internal/filter"
 	"flight-search/internal/models"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,6 +21,12 @@ type SearchHandler struct {
 	Weights    ranking.Weights
 }
 
+// ServeHTTP handles GET /api/v1/search: it validates the required
+// origin/destination/date query params (plus an optional return_date for a  round trip),
+// runs the aggregated provider search for each leg (optionally bypassing the cache),
+// then applies filters, computes best-value scores, sorts the result, and writes the final JSON response.
+// Filters and sort order apply identically to both legs of a round trip
+// -- there is no per-leg override.
 func (h *SearchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "only GET is supported")
@@ -40,6 +48,19 @@ func (h *SearchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	returnDate := strings.TrimSpace(q.Get("return_date"))
+	isRoundTrip := returnDate != ""
+	if isRoundTrip {
+		if _, err := time.Parse("2006-01-02", returnDate); err != nil {
+			writeError(w, http.StatusBadRequest, "return_date must be in YYYY-MM-DD format")
+			return
+		}
+		if returnDate < date {
+			writeError(w, http.StatusBadRequest, "return_date must not be before date")
+			return
+		}
+	}
+
 	passengers := 1
 	if v := q.Get("passengers"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -55,7 +76,29 @@ func (h *SearchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		cabinClass = "economy"
 	}
 
-	params := models.SearchParams{
+	bypassCache := parseBool(q.Get("refresh")) || parseBool(q.Get("no_cache"))
+
+	fp, err := parseFilterParams(q)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	sortOpt := models.SortOption(strings.ToLower(strings.TrimSpace(q.Get("sort_by"))))
+	if sortOpt == "" {
+		sortOpt = models.SortBestValue
+	}
+
+	criteria := models.SearchCriteria{
+		Origin:        origin,
+		Destination:   destination,
+		DepartureDate: date,
+		Passengers:    passengers,
+		CabinClass:    cabinClass,
+		TripType:      models.TripOneWay,
+	}
+
+	outboundParams := models.SearchParams{
 		Origin:      origin,
 		Destination: destination,
 		Date:        date,
@@ -63,47 +106,98 @@ func (h *SearchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		CabinClass:  cabinClass,
 	}
 
-	bypassCache := parseBool(q.Get("refresh")) || parseBool(q.Get("no_cache"))
+	if !isRoundTrip {
+		flights, meta, err := h.searchLeg(r.Context(), outboundParams, bypassCache, fp, sortOpt)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, models.SearchResponse{
+			SearchCriteria: criteria,
+			Metadata:       meta,
+			Flights:        flights,
+		})
+		return
+	}
 
-	flights, meta, err := h.Aggregator.Search(r.Context(), params, bypassCache)
+	// The return leg simply flies the route in reverse on the return date;
+	// everything else (passengers, cabin, filters, sort) is shared.
+	returnParams := models.SearchParams{
+		Origin:      destination,
+		Destination: origin,
+		Date:        returnDate,
+		Passengers:  passengers,
+		CabinClass:  cabinClass,
+	}
+
+	outboundFlights, outboundMeta, returnFlights, returnMeta, err := h.searchBothLegs(r.Context(), outboundParams, returnParams, bypassCache, fp, sortOpt)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 
-	fp, err := parseFilterParams(q)
+	criteria.ReturnDate = returnDate
+	criteria.TripType = models.TripRoundTrip
+
+	writeJSON(w, http.StatusOK, models.SearchResponse{
+		SearchCriteria:    criteria,
+		Metadata:          outboundMeta,
+		ReturnMetadata:    &returnMeta,
+		OutboundFlights:   outboundFlights,
+		ReturnFlights:     returnFlights,
+		RoundTripEstimate: buildRoundTripEstimate(outboundFlights, returnFlights),
+	})
+}
+
+// searchLeg runs one leg's aggregated search, then applies filtering,
+// best-value ranking, and sorting to it. The returned slice is never nil
+// (an empty result is []models.Flight{}) so it marshals as "[]" rather than
+// "null".
+func (h *SearchHandler) searchLeg(ctx context.Context, params models.SearchParams, bypassCache bool, fp models.FilterParams, sortOpt models.SortOption) ([]models.Flight, models.Metadata, error) {
+	flights, meta, err := h.Aggregator.Search(ctx, params, bypassCache)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+		return nil, models.Metadata{}, err
 	}
+
 	flights = filter.Apply(flights, fp)
-
 	ranking.Compute(flights, h.Weights)
-
-	sortOpt := models.SortOption(strings.ToLower(strings.TrimSpace(q.Get("sort_by"))))
-	if sortOpt == "" {
-		sortOpt = models.SortBestValue
-	}
 	sortutil.Apply(flights, sortOpt)
 
 	meta.TotalResults = len(flights)
 	if flights == nil {
 		flights = []models.Flight{}
 	}
+	return flights, meta, nil
+}
 
-	resp := models.SearchResponse{
-		SearchCriteria: models.SearchCriteria{
-			Origin:        origin,
-			Destination:   destination,
-			DepartureDate: date,
-			Passengers:    passengers,
-			CabinClass:    cabinClass,
-		},
-		Metadata: meta,
-		Flights:  flights,
+// searchBothLegs runs the outbound and return legs of a round trip
+// concurrently (each leg already fans out to all providers internally, so
+// running the two legs in parallel roughly halves total latency compared to
+// running them one after another) and returns as soon as both are done. If
+// either leg fails, its error is returned; the other leg's goroutine is
+// still allowed to finish before this function returns.
+func (h *SearchHandler) searchBothLegs(ctx context.Context, outboundParams, returnParams models.SearchParams, bypassCache bool, fp models.FilterParams, sortOpt models.SortOption) (outbound []models.Flight, outboundMeta models.Metadata, ret []models.Flight, returnMeta models.Metadata, err error) {
+	var outboundErr, returnErr error
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		outbound, outboundMeta, outboundErr = h.searchLeg(ctx, outboundParams, bypassCache, fp, sortOpt)
+	}()
+	go func() {
+		defer wg.Done()
+		ret, returnMeta, returnErr = h.searchLeg(ctx, returnParams, bypassCache, fp, sortOpt)
+	}()
+	wg.Wait()
+
+	if outboundErr != nil {
+		return nil, models.Metadata{}, nil, models.Metadata{}, outboundErr
 	}
-
-	writeJSON(w, http.StatusOK, resp)
+	if returnErr != nil {
+		return nil, models.Metadata{}, nil, models.Metadata{}, returnErr
+	}
+	return outbound, outboundMeta, ret, returnMeta, nil
 }
 
 func parseFilterParams(q url.Values) (models.FilterParams, error) {
