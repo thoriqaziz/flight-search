@@ -12,14 +12,35 @@ import (
 type FixtureRoute struct {
 	Path string
 	File string
+	// Method, when set, is the only HTTP method the route accepts
+	// (default: any).
+	Method string
+	// Auth, when set, requires a bearer token issued by this issuer and
+	// serves its token endpoint at TokenPath.
+	Auth      *OAuthIssuer
+	TokenPath string
 }
 
 func NewServer(fixturesDir string, routes []FixtureRoute) http.Handler {
 	mux := http.NewServeMux()
 	for _, r := range routes {
 		route := r
+		if route.Auth != nil {
+			mux.HandleFunc(route.TokenPath, route.Auth.TokenHandler)
+		}
 		mux.HandleFunc(route.Path, func(w http.ResponseWriter, req *http.Request) {
+			if route.Method != "" && req.Method != route.Method {
+				w.Header().Set("Allow", route.Method)
+				http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+				return
+			}
 			simulateLatency(req)
+
+			if route.Auth != nil && !route.Auth.Authorized(req) {
+				w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+				http.Error(w, `{"error":"invalid_token"}`, http.StatusUnauthorized)
+				return
+			}
 
 			if req.URL.Query().Get("fail") == "true" {
 				http.Error(w, `{"error":"simulated provider outage"}`, http.StatusInternalServerError)

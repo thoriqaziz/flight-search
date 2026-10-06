@@ -14,6 +14,13 @@ type Config struct {
 	GarudaURL   string
 	LionAirURL  string
 
+	// OAuth2 client credentials for Garuda's API. Auth is skipped when
+	// GarudaClientID is empty.
+	GarudaTokenURL     string
+	GarudaClientID     string
+	GarudaClientSecret string
+	GarudaScope        string
+
 	ProviderTimeout     time.Duration
 	ProviderHTTPTimeout time.Duration
 
@@ -45,6 +52,11 @@ func Load() Config {
 		BatikAirURL: getEnv("BATIKAIR_API_URL", mockBase+"/batikair/search"),
 		GarudaURL:   getEnv("GARUDA_API_URL", mockBase+"/garuda/search"),
 		LionAirURL:  getEnv("LIONAIR_API_URL", mockBase+"/lionair/search"),
+
+		GarudaTokenURL:     getEnv("GARUDA_TOKEN_URL", mockBase+"/garuda/oauth/token"),
+		GarudaClientID:     getEnv("GARUDA_CLIENT_ID", ""),
+		GarudaClientSecret: getEnv("GARUDA_CLIENT_SECRET", ""),
+		GarudaScope:        getEnv("GARUDA_SCOPE", ""),
 
 		ProviderTimeout:     time.Duration(providerTimeoutMs) * time.Millisecond,
 		ProviderHTTPTimeout: time.Duration(providerHTTPTimeoutMs) * time.Millisecond,

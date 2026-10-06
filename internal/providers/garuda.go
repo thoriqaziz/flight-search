@@ -64,13 +64,28 @@ type garudaResponse struct {
 	Flights []garudaFlight `json:"flights"`
 }
 
+// garudaSearchRequest is the JSON body of Garuda's POST search endpoint.
+type garudaSearchRequest struct {
+	Origin        string `json:"origin"`
+	Destination   string `json:"destination"`
+	DepartureDate string `json:"departure_date"`
+	Passengers    int    `json:"passengers"`
+	CabinClass    string `json:"cabin_class,omitempty"`
+}
+
 type GarudaProvider struct {
 	endpoint string
 	client   *resilientClient
 }
 
-func NewGarudaProvider(endpoint string, client *http.Client, limiter *ratelimit.Limiter, retryCfg retry.Config) *GarudaProvider {
-	return &GarudaProvider{endpoint: endpoint, client: newResilientClient(client, limiter, retryCfg)}
+// NewGarudaProvider builds the Garuda client. Garuda's API is protected by
+// OAuth2 client credentials; pass zero-value creds to call an open endpoint
+// (such as the mock server without GARUDA_CLIENT_ID set).
+func NewGarudaProvider(endpoint string, creds ClientCredentials, client *http.Client, limiter *ratelimit.Limiter, retryCfg retry.Config) *GarudaProvider {
+	return &GarudaProvider{
+		endpoint: endpoint,
+		client:   newResilientClient(client, limiter, retryCfg).withClientCredentials(creds),
+	}
 }
 
 // Name returns the display name used in metadata and price comparisons.
@@ -78,7 +93,18 @@ func (p *GarudaProvider) Name() string { return "Garuda Indonesia" }
 
 func (p *GarudaProvider) Search(ctx context.Context, params models.SearchParams) ([]models.Flight, error) {
 	var raw garudaResponse
-	if err := p.client.fetchJSON(ctx, p.endpoint, params, &raw); err != nil {
+	passengers := params.Passengers
+	if passengers < 1 {
+		passengers = 1
+	}
+	req := garudaSearchRequest{
+		Origin:        params.Origin,
+		Destination:   params.Destination,
+		DepartureDate: params.Date,
+		Passengers:    passengers,
+		CabinClass:    params.CabinClass,
+	}
+	if err := p.client.postJSON(ctx, p.endpoint, req, &raw); err != nil {
 		return nil, err
 	}
 
