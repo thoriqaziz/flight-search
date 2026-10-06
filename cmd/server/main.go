@@ -38,7 +38,12 @@ func main() {
 	provs := []providers.Provider{
 		providers.NewAirAsiaProvider(cfg.AirAsiaURL, httpClient, ratelimit.New(cfg.RateLimitRPS, cfg.RateLimitBurst), retryCfg),
 		providers.NewBatikAirProvider(cfg.BatikAirURL, httpClient, ratelimit.New(cfg.RateLimitRPS, cfg.RateLimitBurst), retryCfg),
-		providers.NewGarudaProvider(cfg.GarudaURL, httpClient, ratelimit.New(cfg.RateLimitRPS, cfg.RateLimitBurst), retryCfg),
+		providers.NewGarudaProvider(cfg.GarudaURL, providers.ClientCredentials{
+			TokenURL:     cfg.GarudaTokenURL,
+			ClientID:     cfg.GarudaClientID,
+			ClientSecret: cfg.GarudaClientSecret,
+			Scope:        cfg.GarudaScope,
+		}, httpClient, ratelimit.New(cfg.RateLimitRPS, cfg.RateLimitBurst), retryCfg),
 		providers.NewLionAirProvider(cfg.LionAirURL, httpClient, ratelimit.New(cfg.RateLimitRPS, cfg.RateLimitBurst), retryCfg),
 	}
 

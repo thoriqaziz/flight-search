@@ -28,6 +28,32 @@ curl "http://localhost:8080/api/v1/search?origin=CGK&destination=DPS&date=2025-1
 
 Run the test suite with `go test ./...`.
 
+### Garuda authentication (OAuth2 client credentials)
+
+The Garuda provider authenticates with a client ID and secret: it calls
+`POST GARUDA_TOKEN_URL` with `grant_type=client_credentials` (HTTP Basic
+auth), caches the returned bearer token until shortly before `expires_in`,
+and sends `Authorization: Bearer <token>` on every search. If the API answers
+401, the cached token is dropped and the search retried with a fresh one; a
+rejected client ID/secret fails immediately without retries.
+
+```
+GARUDA_API_URL=https://api.garuda-indonesia.example/v1/flights/search
+GARUDA_TOKEN_URL=https://auth.garuda-indonesia.example/oauth/token   # default: mock's /garuda/oauth/token
+GARUDA_CLIENT_ID=...
+GARUDA_CLIENT_SECRET=...
+GARUDA_SCOPE=                                               # optional
+```
+
+Garuda's search is a `POST` with a JSON body
+(`{"origin","destination","departure_date","passengers","cabin_class"}`)
+rather than query params; the mock's Garuda route only accepts `POST`.
+
+Auth is skipped when `GARUDA_CLIENT_ID` is empty. The mock server reads the
+same two variables: when they're set, its Garuda endpoint requires a token
+from `POST /garuda/oauth/token`, so one `.env` exercises the full flow
+locally.
+
 ## API
 
 `GET /api/v1/search`
